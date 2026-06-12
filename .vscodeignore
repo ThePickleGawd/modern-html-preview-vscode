@@ -5,3 +5,6 @@ tsconfig.json
 .gitignore
 README.md
 test.html
+demo/**
+image.png
+*.vsix

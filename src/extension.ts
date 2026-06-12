@@ -110,7 +110,6 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
     vscode.ViewColumn.Active,
     {
       enableScripts: true,
-      portMapping: session.webviewPortMappings(),
       retainContextWhenHidden: true,
       localResourceRoots: [session.rootUri],
     },
@@ -209,26 +208,21 @@ class LocalHtmlPreviewSession {
     this.port = server.port;
 
     if (cachedPreviewMode === undefined) {
-      if (vscode.env.uiKind === vscode.UIKind.Desktop) {
-        // Desktop webviews reach the server through the panel's port mapping
-        // on any transport (local, SSH, Remote Tunnels) without needing an
-        // externally reachable port.
-        cachedPreviewMode = 'server';
-      } else {
-        // Web clients have no port mapping, so probe where the browser would
-        // reach a forwarded port. Remote Tunnels map forwarded ports to
-        // auth-gated devtunnels.ms URLs that an iframe cannot sign in to (it
-        // just gets a 401). In that case serve documents over the webview
-        // resource channel instead, which rides the same connection as the
-        // editor and needs no reachable port. The verdict only depends on
-        // the connection type, so it is cached for the window's lifetime.
-        const probeUri = await vscode.env.asExternalUri(vscode.Uri.parse(`http://localhost:${this.port}/`));
-        cachedPreviewMode = isLoopbackAuthority(probeUri.authority) ? 'server' : 'webview';
-        logPreview(`Probed forwarded port ${this.port} -> ${probeUri.authority}`);
+      // Probe where the client would reach a forwarded port. Remote Tunnels
+      // map forwarded ports to auth-gated devtunnels.ms URLs that an iframe
+      // cannot sign in to (it just gets a 401) — and webview portMapping
+      // does not route iframe navigations either, so this applies to desktop
+      // clients as much as web ones. When the port is not reachable on
+      // loopback, serve documents over the webview resource channel instead,
+      // which rides the same connection as the editor and needs no reachable
+      // port. The verdict only depends on the connection type, so it is
+      // cached for the window's lifetime.
+      const probeUri = await vscode.env.asExternalUri(vscode.Uri.parse(`http://localhost:${this.port}/`));
+      cachedPreviewMode = isLoopbackAuthority(probeUri.authority) ? 'server' : 'webview';
+      logPreview(`Probed forwarded port ${this.port} -> ${probeUri.authority}`);
 
-        if (cachedPreviewMode === 'webview') {
-          await stopAllPreviewServers();
-        }
+      if (cachedPreviewMode === 'webview') {
+        await stopAllPreviewServers();
       }
     }
 
@@ -242,19 +236,6 @@ class LocalHtmlPreviewSession {
     logPreview(`Opening ${this.documentUri.toString()}: mode=${this.mode}, uiKind=${uiKind}, remote=${vscode.env.remoteName ?? 'none'}, port=${this.port}`);
   }
 
-  webviewPortMappings(): vscode.WebviewPortMapping[] {
-    if (!this.port || vscode.env.uiKind === vscode.UIKind.Web) {
-      return [];
-    }
-
-    return [
-      {
-        extensionHostPort: this.port,
-        webviewPort: this.port,
-      },
-    ];
-  }
-
   async frameContentForDocument(webview: vscode.Webview): Promise<FrameContent> {
     if (this.mode === 'webview') {
       return { kind: 'srcdoc', value: await this.documentHtmlWithBase(webview) };
@@ -266,14 +247,7 @@ class LocalHtmlPreviewSession {
 
     const route = this.virtualPathForUri(this.documentUri);
     const localUri = vscode.Uri.parse(`http://localhost:${this.port}${route}`);
-
-    if (vscode.env.uiKind === vscode.UIKind.Web) {
-      return { kind: 'src', value: (await vscode.env.asExternalUri(localUri)).toString() };
-    }
-
-    // Desktop: the panel's port mapping routes localhost iframes to the
-    // extension host, so the URL is usable as-is on every transport.
-    return { kind: 'src', value: localUri.toString() };
+    return { kind: 'src', value: (await vscode.env.asExternalUri(localUri)).toString() };
   }
 
   private async documentHtmlWithBase(webview: vscode.Webview): Promise<string> {

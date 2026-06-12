@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Single File Preview Demo</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17201c;
+      --paper: #f7f1df;
+      --green: #24745a;
+      --blue: #315c9d;
+      --red: #c6533f;
+      --line: #2c3b3340;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      background:
+        linear-gradient(90deg, var(--line) 1px, transparent 1px),
+        linear-gradient(0deg, var(--line) 1px, transparent 1px),
+        radial-gradient(circle at 12% 18%, #f3cf61 0 9rem, transparent 9.1rem),
+        radial-gradient(circle at 88% 12%, #8fd0cf 0 11rem, transparent 11.1rem),
+        var(--paper);
+      background-size: 32px 32px, 32px 32px, auto, auto, auto;
+      color: var(--ink);
+      font-family: Georgia, "Times New Roman", serif;
+    }
+
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 52px 0;
+    }
+
+    .panel {
+      border: 3px solid var(--ink);
+      background: color-mix(in srgb, var(--paper) 82%, white);
+      box-shadow: 14px 14px 0 #17201c;
+      padding: clamp(22px, 5vw, 54px);
+    }
+
+    .eyebrow {
+      margin: 0 0 14px;
+      color: var(--red);
+      font: 700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 780px;
+      margin: 0;
+      font-size: clamp(48px, 10vw, 108px);
+      line-height: 0.9;
+    }
+
+    p {
+      max-width: 640px;
+      font-size: 20px;
+      line-height: 1.55;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 34px;
+    }
+
+    .tile {
+      min-height: 118px;
+      border: 2px solid var(--ink);
+      padding: 16px;
+    }
+
+    .tile strong {
+      display: block;
+      color: var(--blue);
+      font: 700 22px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    button {
+      margin-top: 28px;
+      border: 2px solid var(--ink);
+      background: var(--green);
+      color: white;
+      cursor: pointer;
+      font: 700 16px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      min-height: 44px;
+      padding: 0 16px;
+    }
+
+    #result {
+      color: var(--green);
+      font-weight: 700;
+    }
+
+    @media (max-width: 680px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .panel {
+        box-shadow: 8px 8px 0 #17201c;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel">
+      <p class="eyebrow">Single file HTML</p>
+      <h1>Inline styles are active.</h1>
+      <p>
+        This page has no external assets. The background, typography, grid,
+        button, and responsive layout all come from a local <code>&lt;style&gt;</code>
+        block in this one HTML file.
+      </p>
+
+      <div class="grid" aria-label="Inline style checks">
+        <div class="tile"><strong>01</strong> Body background</div>
+        <div class="tile"><strong>02</strong> Embedded CSS</div>
+        <div class="tile"><strong>03</strong> Inline script</div>
+      </div>
+
+      <button type="button" id="check">Run inline script</button>
+      <p id="result" aria-live="polite"></p>
+    </section>
+  </main>
+
+  <script>
+    document.getElementById("check").addEventListener("click", () => {
+      document.getElementById("result").textContent = "Script ran from the same HTML file.";
+    });
+  </script>
+</body>
+</html>

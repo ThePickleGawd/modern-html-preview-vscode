@@ -120,8 +120,7 @@ async function openUrlAtCursor(context: vscode.ExtensionContext): Promise<void> 
 
 async function buildHtmlPreview(webview: vscode.Webview, uri: vscode.Uri): Promise<string> {
   const source = await readTextDocument(uri);
-  const rewritten = rewriteHtmlResourceLinks(source, uri, webview);
-  return injectWebviewCsp(rewritten, webview);
+  return rewriteHtmlResourceLinks(source, uri, webview);
 }
 
 async function readTextDocument(uri: vscode.Uri): Promise<string> {
@@ -469,17 +468,6 @@ function buildErrorPage(webview: vscode.Webview, heading: string, error: unknown
   <pre>${escapeHtml(String(error instanceof Error ? error.message : error))}</pre>
 </body>
 </html>`;
-}
-
-function injectWebviewCsp(html: string, webview: vscode.Webview): string {
-  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} http: https: data: blob:; media-src ${webview.cspSource} http: https: data: blob:; font-src ${webview.cspSource} http: https: data:; style-src ${webview.cspSource} http: https: 'unsafe-inline'; script-src ${webview.cspSource} http: https: 'unsafe-inline' 'unsafe-eval'; connect-src ${webview.cspSource} http: https: ws: wss:; frame-src http: https:;">`;
-  const withoutExistingCsp = html.replace(/<meta\s+[^>]*http-equiv=["']content-security-policy["'][^>]*>/gi, '');
-
-  if (/<head[^>]*>/i.test(withoutExistingCsp)) {
-    return withoutExistingCsp.replace(/<head([^>]*)>/i, `<head$1>\n  ${csp}`);
-  }
-
-  return `<!doctype html><html><head>${csp}</head><body>${withoutExistingCsp}</body></html>`;
 }
 
 function rewriteHtmlResourceLinks(html: string, fileUri: vscode.Uri, webview: vscode.Webview): string {

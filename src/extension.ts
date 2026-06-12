@@ -120,7 +120,8 @@ async function openUrlAtCursor(context: vscode.ExtensionContext): Promise<void> 
 
 async function buildHtmlPreview(webview: vscode.Webview, uri: vscode.Uri): Promise<string> {
   const source = await readTextDocument(uri);
-  return rewriteHtmlResourceLinks(source, uri, webview);
+  const rewritten = rewriteHtmlResourceLinks(source, uri, webview);
+  return injectBrowserDefaults(rewritten);
 }
 
 async function readTextDocument(uri: vscode.Uri): Promise<string> {
@@ -468,6 +469,20 @@ function buildErrorPage(webview: vscode.Webview, heading: string, error: unknown
   <pre>${escapeHtml(String(error instanceof Error ? error.message : error))}</pre>
 </body>
 </html>`;
+}
+
+function injectBrowserDefaults(html: string): string {
+  const defaults = '<style data-vscode-browser-ssh-defaults>html,body{background:white;color:black;}</style>';
+
+  if (/<head[^>]*>/i.test(html)) {
+    return html.replace(/<head([^>]*)>/i, `<head$1>\n${defaults}`);
+  }
+
+  if (/<html[^>]*>/i.test(html)) {
+    return html.replace(/<html([^>]*)>/i, `<html$1><head>${defaults}</head>`);
+  }
+
+  return `<!doctype html><html><head>${defaults}</head><body>${html}</body></html>`;
 }
 
 function rewriteHtmlResourceLinks(html: string, fileUri: vscode.Uri, webview: vscode.Webview): string {

@@ -2,7 +2,7 @@
   "name": "modern-html-preview",
   "displayName": "Modern HTML Preview",
   "description": "Preview workspace HTML files inside VS Code with browser-like behavior.",
-  "version": "0.0.1",
+  "version": "0.0.4",
   "publisher": "dylanlu",
   "license": "MIT",
   "icon": "icon.png",
@@ -35,6 +35,13 @@
     "workspace"
   ],
   "contributes": {
+    "commands": [
+      {
+        "command": "modern-html-preview.openHtml",
+        "title": "Open Preview",
+        "category": "Modern HTML Preview"
+      }
+    ],
     "keybindings": [
       {
         "command": "modern-html-preview.openHtml",

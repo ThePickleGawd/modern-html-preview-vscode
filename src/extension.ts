@@ -5,6 +5,8 @@ import type { AddressInfo } from 'net';
 import * as path from 'path';
 
 const htmlPreviewPanels = new Map<string, HtmlPreviewEntry>();
+const previewServers = new Map<string, Promise<PreviewServer>>();
+let cachedPreviewMode: PreviewMode | undefined;
 const MIME_TYPES: Record<string, string> = {
   '.avif': 'image/avif',
   '.bmp': 'image/bmp',
@@ -61,8 +63,8 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export async function deactivate(): Promise<void> {
-  await Promise.all([...htmlPreviewPanels.values()].map(({ session }) => session.dispose()));
   htmlPreviewPanels.clear();
+  await stopAllPreviewServers();
 }
 
 async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vscode.Uri): Promise<void> {
@@ -82,36 +84,14 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
   }
 
   const session = new LocalHtmlPreviewSession(uri);
-  let frameSrc: string;
-
-  try {
-    frameSrc = await session.start();
-  } catch (error) {
-    const panel = vscode.window.createWebviewPanel(
-      'modernHtmlPreview',
-      title,
-      vscode.ViewColumn.Active,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-      },
-    );
-
-    panel.webview.html = buildErrorPage(panel.webview, `Could not open ${uri.toString()}`, error);
-    panel.onDidDispose(() => {
-      void session.dispose();
-    }, null, context.subscriptions);
-    return;
-  }
-
   const panel = vscode.window.createWebviewPanel(
     'modernHtmlPreview',
     title,
     vscode.ViewColumn.Active,
     {
       enableScripts: true,
-      portMapping: session.webviewPortMappings(),
       retainContextWhenHidden: true,
+      localResourceRoots: [session.rootUri],
     },
   );
   let disposed = false;
@@ -124,14 +104,19 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
     try {
       await panel.webview.postMessage({
         type: 'htmlReload',
-        frameSrc: await session.frameSrcForDocument(),
+        frame: await session.frameContentForDocument(panel.webview),
       } satisfies ExtensionToWebviewMessage);
     } catch (error) {
       panel.webview.html = buildErrorPage(panel.webview, `Could not open ${uri.toString()}`, error);
     }
   }, 150);
 
-  panel.webview.html = buildLocalHtmlPreview(panel.webview, uri, frameSrc);
+  try {
+    const frame = await session.start(panel.webview);
+    panel.webview.html = buildLocalHtmlPreview(panel.webview, uri, frame);
+  } catch (error) {
+    panel.webview.html = buildErrorPage(panel.webview, `Could not open ${uri.toString()}`, error);
+  }
 
   const messageSub = panel.webview.onDidReceiveMessage(async (message: WebviewMessage) => {
     if (message.type !== 'htmlReload') {
@@ -141,7 +126,7 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
     try {
       await panel.webview.postMessage({
         type: 'htmlReload',
-        frameSrc: await session.frameSrcForDocument(),
+        frame: await session.frameContentForDocument(panel.webview),
       } satisfies ExtensionToWebviewMessage);
     } catch (error) {
       await panel.webview.postMessage({
@@ -172,7 +157,9 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
   panel.onDidDispose(() => {
     disposed = true;
     htmlPreviewPanels.delete(uri.toString());
-    void session.dispose();
+    // The shared preview server stays up so that reopening a preview reuses
+    // the same port (and its forwarded-port entry) instead of leaving a dead
+    // entry behind and creating a fresh one.
     messageSub.dispose();
     changeSub.dispose();
     saveSub.dispose();
@@ -185,14 +172,104 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
 class LocalHtmlPreviewSession {
   readonly rootUri: vscode.Uri;
 
-  private server: Server | undefined;
   private port = 0;
+  private mode: PreviewMode = 'server';
 
   constructor(private readonly documentUri: vscode.Uri) {
     this.rootUri = vscode.workspace.getWorkspaceFolder(documentUri)?.uri ?? dirname(documentUri);
   }
 
-  async start(): Promise<string> {
+  async start(webview: vscode.Webview): Promise<FrameContent> {
+    if (cachedPreviewMode !== 'webview') {
+      const server = await previewServerForRoot(this.rootUri);
+      this.port = server.port;
+
+      if (cachedPreviewMode === undefined) {
+        // Probe where the client would reach a forwarded port. Remote
+        // Tunnels, for example, map forwarded ports to auth-gated
+        // devtunnels.ms URLs that an iframe cannot sign in to (it just gets
+        // a 401). In that case serve documents over the webview resource
+        // channel instead, which rides the same connection as the editor and
+        // needs no reachable port. The verdict only depends on the
+        // connection type, so it is cached for the lifetime of the window.
+        const probeUri = await vscode.env.asExternalUri(vscode.Uri.parse(`http://127.0.0.1:${this.port}/`));
+        cachedPreviewMode = isLoopbackAuthority(probeUri.authority) ? 'server' : 'webview';
+
+        if (cachedPreviewMode === 'webview') {
+          await stopAllPreviewServers();
+        }
+      }
+    }
+
+    this.mode = cachedPreviewMode ?? 'server';
+    return this.frameContentForDocument(webview);
+  }
+
+  async frameContentForDocument(webview: vscode.Webview): Promise<FrameContent> {
+    if (this.mode === 'webview') {
+      return { kind: 'srcdoc', value: await this.documentHtmlWithBase(webview) };
+    }
+
+    if (!this.port) {
+      throw new Error('Local preview server is not running.');
+    }
+
+    const route = this.virtualPathForUri(this.documentUri);
+    const localUri = vscode.Uri.parse(`http://127.0.0.1:${this.port}${route}`);
+    return { kind: 'src', value: (await vscode.env.asExternalUri(localUri)).toString() };
+  }
+
+  private async documentHtmlWithBase(webview: vscode.Webview): Promise<string> {
+    const html = (await readPreviewBytes(this.documentUri)).toString('utf8');
+    const baseHref = `${webview.asWebviewUri(dirname(this.documentUri)).toString()}/`;
+    const baseTag = `<base href="${escapeAttr(baseHref)}">`;
+    const anchor = /<head[^>]*>/i.exec(html) ?? /<html[^>]*>/i.exec(html);
+
+    if (anchor) {
+      const insertAt = anchor.index + anchor[0].length;
+      return `${html.slice(0, insertAt)}${baseTag}${html.slice(insertAt)}`;
+    }
+
+    return `${baseTag}${html}`;
+  }
+
+  containsUri(uri: vscode.Uri): boolean {
+    return isWithinRoot(this.rootUri, uri);
+  }
+
+  private virtualPathForUri(uri: vscode.Uri): string {
+    const rootPath = trimTrailingSlash(this.rootUri.path);
+    const filePath = trimTrailingSlash(uri.path);
+    const relativePath = filePath === rootPath
+      ? ''
+      : filePath.startsWith(`${rootPath}/`)
+        ? filePath.slice(rootPath.length + 1)
+        : basename(uri);
+
+    const encoded = relativePath
+      .split('/')
+      .filter(Boolean)
+      .map(encodeURIComponent)
+      .join('/');
+
+    return `/${encoded}`;
+  }
+}
+
+class PreviewServer {
+  port = 0;
+
+  private server: Server | undefined;
+
+  private constructor(private readonly rootUri: vscode.Uri) {}
+
+  static async create(rootUri: vscode.Uri): Promise<PreviewServer> {
+    const instance = new PreviewServer(rootUri);
+    await instance.listen();
+    return instance;
+  }
+
+  private async listen(): Promise<void> {
     this.server = createServer((request, response) => {
       void this.handleFileRequest(request, response);
     });
@@ -209,67 +286,35 @@ class LocalHtmlPreviewSession {
     }
 
     this.port = (address as AddressInfo).port;
-    return this.frameSrcForDocument();
   }
 
-  webviewPortMappings(): vscode.WebviewPortMapping[] {
-    if (!this.port || vscode.env.uiKind === vscode.UIKind.Web) {
-      return [];
-    }
-
-    return [
-      {
-        extensionHostPort: this.port,
-        webviewPort: this.port,
-      },
-    ];
-  }
-
-  async frameSrcForDocument(): Promise<string> {
-    if (!this.port) {
-      throw new Error('Local preview server is not running.');
-    }
-
-    const route = this.virtualPathForUri(this.documentUri);
-    const localUri = vscode.Uri.parse(`http://localhost:${this.port}${route}`);
-
-    if (vscode.env.uiKind === vscode.UIKind.Web) {
-      return (await vscode.env.asExternalUri(localUri)).toString();
-    }
-
-    return localUri.toString();
-  }
-
-  containsUri(uri: vscode.Uri): boolean {
-    if (uri.scheme !== this.rootUri.scheme || uri.authority !== this.rootUri.authority) {
-      return false;
-    }
-
-    const rootPath = trimTrailingSlash(this.rootUri.path);
-    const filePath = trimTrailingSlash(uri.path);
-    return filePath === rootPath || filePath.startsWith(`${rootPath}/`);
-  }
-
-  async dispose(): Promise<void> {
-    await new Promise<void>((resolve) => {
-      this.server?.close(() => resolve());
-      if (!this.server) {
-        resolve();
-      }
-    });
+  async stop(): Promise<void> {
+    const server = this.server;
     this.server = undefined;
+    this.port = 0;
+
+    if (!server) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+      // Without this, close() waits for the iframe's keep-alive sockets to
+      // time out (~5s). Nobody is previewing by now, so just drop them.
+      server.closeAllConnections();
+    });
   }
 
   private async handleFileRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const resourceUri = await this.resourceUriForRequest(request);
 
-      if (!resourceUri || !this.containsUri(resourceUri)) {
+      if (!resourceUri || !isWithinRoot(this.rootUri, resourceUri)) {
         respondText(response, 404, 'Not found');
         return;
       }
 
-      const bytes = await this.readPreviewBytes(resourceUri);
+      const bytes = await readPreviewBytes(resourceUri);
       const contentType = contentTypeForPath(resourceUri.path);
       const range = parseRangeHeader(request.headers.range, bytes.byteLength);
 
@@ -317,7 +362,7 @@ class LocalHtmlPreviewSession {
   }
 
   private async resourceUriForRequest(request: IncomingMessage): Promise<vscode.Uri | undefined> {
-    const parsed = new URL(request.url ?? '/', 'http://localhost');
+    const parsed = new URL(request.url ?? '/', 'http://127.0.0.1');
     const pathSegments = safeRequestSegments(parsed.pathname);
     let resourceUri = pathSegments.length === 0
       ? vscode.Uri.joinPath(this.rootUri, 'index.html')
@@ -337,44 +382,65 @@ class LocalHtmlPreviewSession {
     return resourceUri;
   }
 
-  private async readPreviewBytes(uri: vscode.Uri): Promise<Buffer> {
-    const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
-
-    if (openDocument) {
-      return Buffer.from(openDocument.getText(), 'utf8');
-    }
-
-    const bytes = await vscode.workspace.fs.readFile(uri);
-    return Buffer.from(bytes);
-  }
-
-  private virtualPathForUri(uri: vscode.Uri): string {
-    const rootPath = trimTrailingSlash(this.rootUri.path);
-    const filePath = trimTrailingSlash(uri.path);
-    const relativePath = filePath === rootPath
-      ? ''
-      : filePath.startsWith(`${rootPath}/`)
-        ? filePath.slice(rootPath.length + 1)
-        : basename(uri);
-
-    const encoded = relativePath
-      .split('/')
-      .filter(Boolean)
-      .map(encodeURIComponent)
-      .join('/');
-
-    return `/${encoded}`;
-  }
 }
 
-function buildLocalHtmlPreview(webview: vscode.Webview, fileUri: vscode.Uri, frameSrc: string): string {
+function previewServerForRoot(rootUri: vscode.Uri): Promise<PreviewServer> {
+  const key = rootUri.toString();
+  let pending = previewServers.get(key);
+
+  if (!pending) {
+    pending = PreviewServer.create(rootUri);
+    pending.catch(() => previewServers.delete(key));
+    previewServers.set(key, pending);
+  }
+
+  return pending;
+}
+
+async function stopAllPreviewServers(): Promise<void> {
+  const pending = [...previewServers.values()];
+  previewServers.clear();
+
+  await Promise.all(pending.map(async (server) => {
+    try {
+      await (await server).stop();
+    } catch {
+      // The server never started; there is nothing to stop.
+    }
+  }));
+}
+
+async function readPreviewBytes(uri: vscode.Uri): Promise<Buffer> {
+  const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
+
+  if (openDocument) {
+    return Buffer.from(openDocument.getText(), 'utf8');
+  }
+
+  const bytes = await vscode.workspace.fs.readFile(uri);
+  return Buffer.from(bytes);
+}
+
+function buildLocalHtmlPreview(webview: vscode.Webview, fileUri: vscode.Uri, frame: FrameContent): string {
   const nonce = getNonce();
   const title = basename(fileUri);
+  // srcdoc documents inherit this page's CSP, so in webview-served mode any
+  // restrictive policy here would also strangle the previewed page. Skip the
+  // CSP there to keep browser-like behavior; keep it for the server mode.
+  const csp = frame.kind === 'src'
+    ? `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http: https:; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">`
+    : '';
+  const frameAttr = frame.kind === 'src'
+    ? `src="${escapeAttr(frame.value)}"`
+    : `srcdoc="${escapeAttr(frame.value)}"`;
+  const fallbackBadge = frame.kind === 'srcdoc'
+    ? `<span class="badge" title="Forwarded ports are not directly reachable from this client (e.g. Remote Tunnel), so the page is served through VS Code instead of a local HTTP server. Root-relative URLs and multi-page navigation may behave differently.">Fallback (no port)</span>`
+    : '';
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http: https:; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+  ${csp}
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(title)}</title>
   <style nonce="${nonce}">
@@ -404,9 +470,19 @@ function buildLocalHtmlPreview(webview: vscode.Webview, fileUri: vscode.Uri, fra
       border-bottom: 1px solid var(--border);
       display: grid;
       gap: 8px;
-      grid-template-columns: minmax(120px, 1fr) auto;
+      grid-template-columns: minmax(120px, 1fr) auto auto;
       height: 36px;
       padding: 5px 8px;
+    }
+
+    .badge {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      color: var(--vscode-descriptionForeground);
+      cursor: default;
+      font-size: 11px;
+      padding: 2px 8px;
+      white-space: nowrap;
     }
 
     .path {
@@ -443,19 +519,28 @@ function buildLocalHtmlPreview(webview: vscode.Webview, fileUri: vscode.Uri, fra
 <body>
   <div class="toolbar">
     <div class="path" title="${escapeAttr(fileUri.fsPath || fileUri.toString())}">${escapeHtml(fileUri.fsPath || fileUri.toString())}</div>
+    ${fallbackBadge}
     <button id="reload" type="button" title="Reload preview">Reload</button>
   </div>
-  <iframe id="frame" src="${escapeAttr(frameSrc)}" sandbox="allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"></iframe>
+  <iframe id="frame" ${frameAttr} sandbox="allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"></iframe>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    let frame = document.getElementById('frame');
+    let frameEl = document.getElementById('frame');
     const reload = document.getElementById('reload');
 
-    function loadFrame(src) {
-      const next = frame.cloneNode(false);
-      next.src = src;
-      frame.replaceWith(next);
-      frame = next;
+    function loadFrame(frame) {
+      const next = frameEl.cloneNode(false);
+      next.removeAttribute('src');
+      next.removeAttribute('srcdoc');
+
+      if (frame.kind === 'src') {
+        next.src = frame.value;
+      } else {
+        next.srcdoc = frame.value;
+      }
+
+      frameEl.replaceWith(next);
+      frameEl = next;
     }
 
     reload.addEventListener('click', () => {
@@ -466,7 +551,7 @@ function buildLocalHtmlPreview(webview: vscode.Webview, fileUri: vscode.Uri, fra
       const message = event.data;
 
       if (message && message.type === 'htmlReload') {
-        loadFrame(message.frameSrc);
+        loadFrame(message.frame);
       }
 
       if (message && message.type === 'error') {
@@ -547,6 +632,21 @@ function safeRequestSegments(pathname: string): string[] {
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '') || '/';
+}
+
+function isLoopbackAuthority(authority: string): boolean {
+  const host = authority.replace(/:\d+$/, '').toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '0.0.0.0';
+}
+
+function isWithinRoot(rootUri: vscode.Uri, uri: vscode.Uri): boolean {
+  if (uri.scheme !== rootUri.scheme || uri.authority !== rootUri.authority) {
+    return false;
+  }
+
+  const rootPath = trimTrailingSlash(rootUri.path);
+  const filePath = trimTrailingSlash(uri.path);
+  return filePath === rootPath || filePath.startsWith(`${rootPath}/`);
 }
 
 function contentTypeForPath(filePath: string): string {
@@ -647,9 +747,15 @@ function escapeAttr(value: string): string {
   return escapeHtml(value);
 }
 
+type PreviewMode = 'server' | 'webview';
+
+type FrameContent =
+  | { kind: 'src'; value: string }
+  | { kind: 'srcdoc'; value: string };
+
 type WebviewMessage =
   | { type: 'htmlReload' };
 
 type ExtensionToWebviewMessage =
-  | { type: 'htmlReload'; frameSrc: string }
+  | { type: 'htmlReload'; frame: FrameContent }
   | { type: 'error'; message: string };

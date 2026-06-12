@@ -1,7 +1,7 @@
 {
-  "name": "improved-html-preview",
-  "displayName": "Improved HTML Preview",
-  "description": "Preview workspace HTML files and local or remote HTTP/HTTPS URLs inside VS Code with browser-like behavior.",
+  "name": "modern-html-preview",
+  "displayName": "Modern HTML Preview",
+  "description": "Preview workspace HTML files inside VS Code with browser-like behavior.",
   "version": "0.0.1",
   "publisher": "local",
   "license": "MIT",
@@ -12,35 +12,16 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:improved-html-preview.openHtml",
-    "onCommand:improved-html-preview.openUrl",
-    "onCommand:improved-html-preview.openUrlAtCursor"
+    "onCommand:modern-html-preview.openHtml"
   ],
   "main": "./dist/extension.js",
   "extensionKind": [
     "workspace"
   ],
   "contributes": {
-    "commands": [
-      {
-        "command": "improved-html-preview.openHtml",
-        "title": "Open HTML Preview",
-        "category": "Improved HTML Preview"
-      },
-      {
-        "command": "improved-html-preview.openUrl",
-        "title": "Open URL Preview",
-        "category": "Improved HTML Preview"
-      },
-      {
-        "command": "improved-html-preview.openUrlAtCursor",
-        "title": "Open URL at Cursor",
-        "category": "Improved HTML Preview"
-      }
-    ],
     "keybindings": [
       {
-        "command": "improved-html-preview.openHtml",
+        "command": "modern-html-preview.openHtml",
         "key": "ctrl+shift+v",
         "mac": "cmd+shift+v",
         "when": "editorTextFocus && (resourceExtname == .html || resourceExtname == .htm)"

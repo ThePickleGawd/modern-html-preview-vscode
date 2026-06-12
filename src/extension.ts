@@ -472,7 +472,7 @@ function buildErrorPage(webview: vscode.Webview, heading: string, error: unknown
 }
 
 function injectBrowserDefaults(html: string): string {
-  const defaults = '<style data-vscode-browser-ssh-defaults>html,body{background:white;color:black;}</style>';
+  const defaults = '<style data-vscode-browser-ssh-defaults>html{background:white;color:black;color-scheme:light;}body{background:white;color:black;}</style>';
 
   if (/<head[^>]*>/i.test(html)) {
     return html.replace(/<head([^>]*)>/i, `<head$1>\n${defaults}`);

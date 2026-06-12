@@ -3,14 +3,29 @@
   "displayName": "Modern HTML Preview",
   "description": "Preview workspace HTML files inside VS Code with browser-like behavior.",
   "version": "0.0.1",
-  "publisher": "local",
+  "publisher": "dylanlu",
   "license": "MIT",
   "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ThePickleGawd/modern-html-preview-vscode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ThePickleGawd/modern-html-preview-vscode/issues"
+  },
+  "homepage": "https://github.com/ThePickleGawd/modern-html-preview-vscode#readme",
   "engines": {
     "vscode": "^1.90.0"
   },
   "categories": [
     "Other"
+  ],
+  "keywords": [
+    "html",
+    "preview",
+    "browser",
+    "remote",
+    "ssh"
   ],
   "activationEvents": [
     "onCommand:modern-html-preview.openHtml"
@@ -34,7 +49,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "check": "tsc --noEmit -p ./",
-    "package": "vsce package --allow-missing-repository"
+    "package": "vsce package"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

@@ -46,41 +46,6 @@
         "when": "editorTextFocus && (resourceExtname == .html || resourceExtname == .htm)"
       }
     ],
-    "configuration": {
-      "title": "Browser SSH",
-      "properties": {
-        "vscode-browser-ssh.browserExecutablePath": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Absolute path to Chrome or Chromium on the extension host. In Remote SSH this is the remote server path. Leave empty to auto-detect common locations."
-        },
-        "vscode-browser-ssh.frameRate": {
-          "type": "number",
-          "default": 6,
-          "minimum": 1,
-          "maximum": 20,
-          "markdownDescription": "Maximum screenshot frames per second for remote-rendered URL previews."
-        },
-        "vscode-browser-ssh.jpegQuality": {
-          "type": "number",
-          "default": 72,
-          "minimum": 30,
-          "maximum": 95,
-          "markdownDescription": "JPEG quality for streamed remote browser frames."
-        },
-        "vscode-browser-ssh.launchArgs": {
-          "type": "array",
-          "default": [
-            "--no-sandbox",
-            "--disable-dev-shm-usage"
-          ],
-          "items": {
-            "type": "string"
-          },
-          "markdownDescription": "Additional launch arguments passed to Chrome or Chromium on the extension host."
-        }
-      }
-    },
     "menus": {
       "explorer/context": [
         {
@@ -115,9 +80,7 @@
     "@types/node": "^22.10.2",
     "@types/vscode": "^1.90.0",
     "@vscode/vsce": "^3.2.1",
+    "playwright-core": "^1.60.0",
     "typescript": "^5.7.2"
-  },
-  "dependencies": {
-    "playwright-core": "^1.60.0"
   }
 }

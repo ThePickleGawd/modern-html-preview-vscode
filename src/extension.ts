@@ -1,14 +1,20 @@
 import * as vscode from 'vscode';
 import { existsSync } from 'fs';
+import { createServer } from 'http';
+import type { IncomingMessage, Server, ServerResponse } from 'http';
+import { connect as netConnect } from 'net';
+import type { AddressInfo, Socket } from 'net';
 import { platform } from 'os';
 import { delimiter, join } from 'path';
-import { chromium } from 'playwright-core';
-import type { Browser, Page } from 'playwright-core';
+import type { Duplex } from 'stream';
+import { connect as tlsConnect } from 'tls';
+import type { Browser, CDPSession, Page } from 'playwright-core';
 
 const HTTP_URL_RE = /^https?:\/\//i;
 const URL_LIKE_RE = /\bhttps?:\/\/[^\s<>"']+/i;
 const MIN_VIEWPORT_WIDTH = 320;
 const MIN_VIEWPORT_HEIGHT = 240;
+const htmlPreviewPanels = new Map<string, vscode.WebviewPanel>();
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
@@ -31,6 +37,13 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
   }
 
   const title = `Preview: ${basename(uri)}`;
+  const existingPanel = htmlPreviewPanels.get(uri.toString());
+
+  if (existingPanel) {
+    existingPanel.reveal(vscode.ViewColumn.Active);
+    return;
+  }
+
   const directory = dirname(uri);
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
   const panel = vscode.window.createWebviewPanel(
@@ -65,10 +78,12 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
   });
 
   panel.onDidDispose(() => {
+    htmlPreviewPanels.delete(uri.toString());
     changeSub.dispose();
     saveSub.dispose();
   }, null, context.subscriptions);
 
+  htmlPreviewPanels.set(uri.toString(), panel);
   update();
 }
 
@@ -80,15 +95,16 @@ async function openUrlPreview(context: vscode.ExtensionContext, initialUrl?: str
   }
 
   const panel = vscode.window.createWebviewPanel(
-    'vscodeBrowserSshRemoteBrowser',
-    `Remote: ${url}`,
-    vscode.ViewColumn.Beside,
+    'vscodeBrowserSshProxyBrowser',
+    `Browser: ${url}`,
+    vscode.ViewColumn.Active,
     {
       enableScripts: true,
       retainContextWhenHidden: true,
     },
   );
-  const session = new RemoteBrowserSession(panel, url);
+  const session = new RemoteProxyBrowserSession(panel, url);
+  const frameSrc = await session.start();
 
   panel.webview.onDidReceiveMessage(async (message: WebviewMessage) => {
     await session.handleMessage(message);
@@ -98,7 +114,7 @@ async function openUrlPreview(context: vscode.ExtensionContext, initialUrl?: str
     void session.dispose();
   }, null, context.subscriptions);
 
-  panel.webview.html = buildRemoteBrowserPreview(panel.webview, url);
+  panel.webview.html = buildProxyBrowserPreview(panel.webview, url, frameSrc);
 }
 
 async function openUrlAtCursor(context: vscode.ExtensionContext): Promise<void> {
@@ -125,17 +141,192 @@ async function readTextDocument(uri: vscode.Uri): Promise<string> {
   return new TextDecoder('utf-8').decode(bytes);
 }
 
+class RemoteProxyBrowserSession {
+  private server: Server | undefined;
+  private port = 0;
+  private currentOrigin: string;
+
+  constructor(
+    private readonly panel: vscode.WebviewPanel,
+    initialUrl: string,
+  ) {
+    const parsed = new URL(initialUrl);
+    this.currentOrigin = parsed.origin;
+  }
+
+  async start(): Promise<string> {
+    this.server = createServer((request, response) => {
+      void this.handleHttpRequest(request, response);
+    });
+    this.server.on('upgrade', (request, socket, head) => {
+      this.handleUpgrade(request, socket, head);
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      this.server?.once('error', reject);
+      this.server?.listen(0, '127.0.0.1', () => resolve());
+    });
+
+    const address = this.server.address();
+
+    if (!address || typeof address === 'string') {
+      throw new Error('Could not start remote proxy server.');
+    }
+
+    this.port = (address as AddressInfo).port;
+    return this.frameSrcFor(new URL(this.currentOrigin));
+  }
+
+  async handleMessage(message: WebviewMessage): Promise<void> {
+    if (message.type !== 'proxyNavigate') {
+      return;
+    }
+
+    const url = normalizeUrl(message.url);
+
+    if (!url) {
+      await this.panel.webview.postMessage({
+        type: 'error',
+        message: 'Enter a valid http:// or https:// URL.',
+      } satisfies ExtensionToWebviewMessage);
+      return;
+    }
+
+    const parsed = new URL(url);
+    this.currentOrigin = parsed.origin;
+    const frameSrc = await this.frameSrcFor(parsed);
+    this.panel.title = `Browser: ${url}`;
+    await this.panel.webview.postMessage({
+      type: 'proxyNavigate',
+      frameSrc,
+      url,
+    } satisfies ExtensionToWebviewMessage);
+  }
+
+  async dispose(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      this.server?.close(() => resolve());
+      if (!this.server) {
+        resolve();
+      }
+    });
+    this.server = undefined;
+  }
+
+  private async handleHttpRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    try {
+      const target = this.targetUrlForRequest(request);
+      const body = await readRequestBody(request);
+      const upstream = await fetch(target, {
+        method: request.method,
+        headers: requestHeadersForTarget(request, target),
+        body,
+        redirect: 'manual',
+      });
+
+      if (isHtmlRequest(request, upstream)) {
+        this.currentOrigin = upstream.url ? new URL(upstream.url).origin : target.origin;
+      }
+
+      response.writeHead(upstream.status, responseHeadersForClient(upstream.headers, this.port, this.currentOrigin));
+
+      const contentType = upstream.headers.get('content-type') ?? '';
+
+      if (isRedirect(upstream.status)) {
+        response.end();
+        return;
+      }
+
+      if (contentType.includes('text/html')) {
+        const html = await upstream.text();
+        response.end(rewriteHtmlForProxy(html, upstream.url || target.toString(), this.currentOrigin));
+        return;
+      }
+
+      if (contentType.includes('text/css')) {
+        const css = await upstream.text();
+        response.end(rewriteCssForProxy(css, upstream.url || target.toString(), this.currentOrigin));
+        return;
+      }
+
+      const bytes = Buffer.from(await upstream.arrayBuffer());
+      response.end(bytes);
+    } catch (error) {
+      response.writeHead(502, {
+        'content-type': 'text/plain; charset=utf-8',
+      });
+      response.end(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    let target: URL;
+
+    try {
+      target = this.targetUrlForRequest(request);
+      target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:';
+    } catch {
+      socket.destroy();
+      return;
+    }
+
+    const isSecure = target.protocol === 'wss:';
+    const port = Number(target.port || (isSecure ? 443 : 80));
+    const upstream = isSecure
+      ? tlsConnect({ host: target.hostname, port, servername: target.hostname })
+      : netConnect({ host: target.hostname, port });
+
+    upstream.on('connect', () => {
+      const path = `${target.pathname}${target.search}`;
+      const headers = upgradeHeadersForTarget(request, target);
+      upstream.write(`${request.method ?? 'GET'} ${path || '/'} HTTP/${request.httpVersion}\r\n${headers}\r\n`);
+
+      if (head.length > 0) {
+        upstream.write(head);
+      }
+
+      socket.pipe(upstream);
+      upstream.pipe(socket);
+    });
+    upstream.on('error', () => socket.destroy());
+    socket.on('error', () => upstream.destroy());
+  }
+
+  private targetUrlForRequest(request: IncomingMessage): URL {
+    const rawUrl = request.url ?? '/';
+    const local = new URL(rawUrl, 'http://127.0.0.1');
+
+    if (local.pathname.startsWith('/__vscode_browser_ssh__/abs/')) {
+      const encoded = local.pathname.slice('/__vscode_browser_ssh__/abs/'.length);
+      return new URL(decodeBase64Url(encoded));
+    }
+
+    return new URL(`${local.pathname}${local.search}`, this.currentOrigin);
+  }
+
+  private async frameSrcFor(target: URL): Promise<string> {
+    const localUri = vscode.Uri.parse(`http://127.0.0.1:${this.port}${target.pathname}${target.search}${target.hash}`);
+    return (await vscode.env.asExternalUri(localUri)).toString();
+  }
+}
+
 class RemoteBrowserSession {
   private browser: Browser | undefined;
   private page: Page | undefined;
+  private cdpSession: CDPSession | undefined;
   private frameTimer: NodeJS.Timeout | undefined;
+  private screencastFallbackTimer: NodeJS.Timeout | undefined;
+  private screencastActive = false;
+  private screenshotCapturing = false;
+  private receivedScreencastFrame = false;
+  private lastFrameAt = 0;
   private disposed = false;
-  private capturing = false;
   private address: string;
   private viewport = {
     width: 1024,
     height: 720,
   };
+  private deviceScaleFactor = 1;
 
   constructor(
     private readonly panel: vscode.WebviewPanel,
@@ -152,42 +343,50 @@ class RemoteBrowserSession {
     try {
       switch (message.type) {
         case 'ready':
-          await this.start(message.width, message.height);
+          await this.start(message.width, message.height, message.devicePixelRatio);
           break;
         case 'navigate':
           await this.navigate(message.url);
           break;
         case 'resize':
-          await this.resize(message.width, message.height);
+          await this.resize(message.width, message.height, message.devicePixelRatio);
           break;
         case 'mouseMove':
           await this.page?.mouse.move(message.x, message.y);
+          this.requestScreenshotFrame();
           break;
         case 'mouseDown':
           await this.page?.mouse.move(message.x, message.y);
           await this.page?.mouse.down({ button: message.button });
+          this.requestScreenshotFrame();
           break;
         case 'mouseUp':
           await this.page?.mouse.move(message.x, message.y);
           await this.page?.mouse.up({ button: message.button });
+          this.requestScreenshotFrame();
           break;
         case 'wheel':
           await this.page?.mouse.wheel(message.deltaX, message.deltaY);
+          this.requestScreenshotFrame();
           break;
         case 'key':
           await this.sendKey(message);
+          this.requestScreenshotFrame();
           break;
         case 'back':
           await this.page?.goBack({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
           await this.afterNavigation();
+          this.requestScreenshotFrame();
           break;
         case 'forward':
           await this.page?.goForward({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
           await this.afterNavigation();
+          this.requestScreenshotFrame();
           break;
         case 'reload':
           await this.page?.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
           await this.afterNavigation();
+          this.requestScreenshotFrame();
           break;
       }
     } catch (error) {
@@ -198,23 +397,22 @@ class RemoteBrowserSession {
   async dispose(): Promise<void> {
     this.disposed = true;
 
-    if (this.frameTimer) {
-      clearInterval(this.frameTimer);
-      this.frameTimer = undefined;
-    }
-
+    await this.stopScreencast();
+    this.stopScreenshotLoop();
     await this.browser?.close().catch(() => undefined);
     this.browser = undefined;
     this.page = undefined;
+    this.cdpSession = undefined;
   }
 
-  private async start(width: number, height: number): Promise<void> {
+  private async start(width: number, height: number, devicePixelRatio: number): Promise<void> {
     if (this.page) {
-      await this.resize(width, height);
+      await this.resize(width, height, devicePixelRatio);
       return;
     }
 
     this.viewport = normalizeViewport(width, height);
+    this.deviceScaleFactor = normalizeDeviceScaleFactor(devicePixelRatio);
     this.postStatus('Launching remote browser...');
 
     const config = getRemoteBrowserConfig();
@@ -226,6 +424,7 @@ class RemoteBrowserSession {
       );
     }
 
+    const { chromium } = await import('playwright-core');
     this.browser = await chromium.launch({
       executablePath,
       headless: true,
@@ -233,6 +432,11 @@ class RemoteBrowserSession {
     });
     this.page = await this.browser.newPage({
       viewport: this.viewport,
+      deviceScaleFactor: this.deviceScaleFactor,
+    });
+    this.cdpSession = await this.page.context().newCDPSession(this.page);
+    this.cdpSession.on('Page.screencastFrame', (event: ScreencastFrameEvent) => {
+      void this.handleScreencastFrame(event);
     });
 
     this.page.on('framenavigated', (frame) => {
@@ -245,8 +449,9 @@ class RemoteBrowserSession {
     this.page.on('pageerror', (error) => this.postStatus(`Page error: ${error.message}`));
     this.page.on('dialog', (dialog) => void dialog.dismiss().catch(() => undefined));
 
+    await this.applyDeviceMetrics();
+    await this.startScreencast();
     await this.navigate(this.address);
-    this.startFrameLoop(config.frameRate);
   }
 
   private async navigate(rawUrl: string | undefined): Promise<void> {
@@ -267,20 +472,28 @@ class RemoteBrowserSession {
       this.postError(error);
     });
     await this.afterNavigation();
-    await this.captureFrame();
+    this.requestScreenshotFrame();
   }
 
-  private async resize(width: number, height: number): Promise<void> {
+  private async resize(width: number, height: number, devicePixelRatio: number): Promise<void> {
     const viewport = normalizeViewport(width, height);
+    const nextDeviceScaleFactor = normalizeDeviceScaleFactor(devicePixelRatio);
 
-    if (viewport.width === this.viewport.width && viewport.height === this.viewport.height) {
+    if (
+      viewport.width === this.viewport.width
+      && viewport.height === this.viewport.height
+      && nextDeviceScaleFactor === this.deviceScaleFactor
+    ) {
       return;
     }
 
     this.viewport = viewport;
+    this.deviceScaleFactor = nextDeviceScaleFactor;
     await this.page?.setViewportSize(viewport);
+    await this.applyDeviceMetrics();
     this.postViewport();
-    await this.captureFrame();
+    await this.restartScreencast();
+    this.requestScreenshotFrame();
   }
 
   private async sendKey(message: Extract<WebviewMessage, { type: 'key' }>): Promise<void> {
@@ -300,29 +513,126 @@ class RemoteBrowserSession {
     }
   }
 
-  private startFrameLoop(frameRate: number): void {
-    if (this.frameTimer) {
-      clearInterval(this.frameTimer);
-    }
-
-    const intervalMs = Math.max(50, Math.round(1000 / frameRate));
-    this.frameTimer = setInterval(() => {
-      void this.captureFrame();
-    }, intervalMs);
-  }
-
-  private async captureFrame(): Promise<void> {
-    if (!this.page || this.disposed || this.capturing) {
+  private async startScreencast(): Promise<void> {
+    if (!this.cdpSession || this.screencastActive || this.disposed) {
       return;
     }
 
-    this.capturing = true;
+    const config = getRemoteBrowserConfig();
+    this.receivedScreencastFrame = false;
+    await this.cdpSession.send('Page.startScreencast', {
+      format: 'jpeg',
+      quality: config.jpegQuality,
+      maxWidth: Math.round(this.viewport.width * this.deviceScaleFactor),
+      maxHeight: Math.round(this.viewport.height * this.deviceScaleFactor),
+      everyNthFrame: 1,
+    });
+    this.screencastActive = true;
+    this.screencastFallbackTimer = setTimeout(() => {
+      if (!this.receivedScreencastFrame && !this.disposed) {
+        void this.startScreenshotFallback();
+      }
+    }, 1200);
+  }
+
+  private async applyDeviceMetrics(): Promise<void> {
+    await this.cdpSession?.send('Emulation.setDeviceMetricsOverride', {
+      width: this.viewport.width,
+      height: this.viewport.height,
+      deviceScaleFactor: this.deviceScaleFactor,
+      mobile: false,
+    }).catch(() => undefined);
+  }
+
+  private async stopScreencast(): Promise<void> {
+    if (!this.cdpSession || !this.screencastActive) {
+      return;
+    }
+
+    this.screencastActive = false;
+    this.clearScreencastFallbackTimer();
+    await this.cdpSession.send('Page.stopScreencast').catch(() => undefined);
+  }
+
+  private async restartScreencast(): Promise<void> {
+    this.stopScreenshotLoop();
+    await this.stopScreencast();
+    await this.startScreencast();
+  }
+
+  private async handleScreencastFrame(event: ScreencastFrameEvent): Promise<void> {
+    await this.cdpSession?.send('Page.screencastFrameAck', { sessionId: event.sessionId }).catch(() => undefined);
+
+    if (this.disposed) {
+      return;
+    }
+
+    this.receivedScreencastFrame = true;
+    this.clearScreencastFallbackTimer();
+    const config = getRemoteBrowserConfig();
+    const minIntervalMs = Math.max(16, Math.round(1000 / config.frameRate));
+    const now = Date.now();
+
+    if (now - this.lastFrameAt < minIntervalMs) {
+      return;
+    }
+
+    this.lastFrameAt = now;
+    await this.panel.webview.postMessage({
+      type: 'frame',
+      src: `data:image/jpeg;base64,${event.data}`,
+      width: this.viewport.width,
+      height: this.viewport.height,
+      imageWidth: Math.round(this.viewport.width * this.deviceScaleFactor),
+      imageHeight: Math.round(this.viewport.height * this.deviceScaleFactor),
+    } satisfies ExtensionToWebviewMessage);
+  }
+
+  private async startScreenshotFallback(): Promise<void> {
+    await this.stopScreencast();
+    this.postStatus('Remote browser ready (screenshot fallback)');
+    this.startScreenshotLoop();
+  }
+
+  private startScreenshotLoop(): void {
+    if (this.frameTimer) {
+      return;
+    }
+
+    const intervalMs = Math.max(66, Math.round(1000 / getRemoteBrowserConfig().frameRate));
+    this.frameTimer = setInterval(() => {
+      void this.captureScreenshotFrame();
+    }, intervalMs);
+    void this.captureScreenshotFrame();
+  }
+
+  private stopScreenshotLoop(): void {
+    if (this.frameTimer) {
+      clearInterval(this.frameTimer);
+      this.frameTimer = undefined;
+    }
+  }
+
+  private requestScreenshotFrame(): void {
+    if (!this.frameTimer || this.disposed) {
+      return;
+    }
+
+    void this.captureScreenshotFrame();
+  }
+
+  private async captureScreenshotFrame(): Promise<void> {
+    if (!this.page || this.disposed || this.screenshotCapturing) {
+      return;
+    }
+
+    this.screenshotCapturing = true;
 
     try {
-      const quality = getRemoteBrowserConfig().jpegQuality;
+      const config = getRemoteBrowserConfig();
       const bytes = await this.page.screenshot({
         type: 'jpeg',
-        quality,
+        quality: config.jpegQuality,
         animations: 'allow',
       });
       await this.panel.webview.postMessage({
@@ -330,13 +640,22 @@ class RemoteBrowserSession {
         src: `data:image/jpeg;base64,${bytes.toString('base64')}`,
         width: this.viewport.width,
         height: this.viewport.height,
+        imageWidth: Math.round(this.viewport.width * this.deviceScaleFactor),
+        imageHeight: Math.round(this.viewport.height * this.deviceScaleFactor),
       } satisfies ExtensionToWebviewMessage);
     } catch (error) {
       if (!this.disposed) {
         this.postError(error);
       }
     } finally {
-      this.capturing = false;
+      this.screenshotCapturing = false;
+    }
+  }
+
+  private clearScreencastFallbackTimer(): void {
+    if (this.screencastFallbackTimer) {
+      clearTimeout(this.screencastFallbackTimer);
+      this.screencastFallbackTimer = undefined;
     }
   }
 
@@ -380,6 +699,145 @@ class RemoteBrowserSession {
       message,
     } satisfies ExtensionToWebviewMessage);
   }
+}
+
+function buildProxyBrowserPreview(webview: vscode.Webview, initialUrl: string, frameSrc: string): string {
+  const nonce = getNonce();
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http: https:; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Browser SSH Preview</title>
+  <style nonce="${nonce}">
+    :root {
+      color-scheme: light dark;
+      --border: color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
+      --input-bg: var(--vscode-input-background);
+      --input-fg: var(--vscode-input-foreground);
+      --button-bg: var(--vscode-button-background);
+      --button-fg: var(--vscode-button-foreground);
+      --button-hover: var(--vscode-button-hoverBackground);
+      --error: var(--vscode-errorForeground);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      background: var(--vscode-editor-background);
+      color: var(--vscode-editor-foreground);
+      font-family: var(--vscode-font-family);
+      height: 100vh;
+      margin: 0;
+      overflow: hidden;
+    }
+
+    form {
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      display: grid;
+      gap: 8px;
+      grid-template-columns: minmax(160px, 1fr) auto minmax(120px, auto);
+      height: 42px;
+      padding: 6px 8px;
+    }
+
+    input {
+      background: var(--input-bg);
+      border: 1px solid var(--border);
+      color: var(--input-fg);
+      font: inherit;
+      height: 28px;
+      min-width: 0;
+      padding: 0 8px;
+    }
+
+    button {
+      background: var(--button-bg);
+      border: 0;
+      color: var(--button-fg);
+      cursor: pointer;
+      font: inherit;
+      height: 28px;
+      padding: 0 10px;
+    }
+
+    button:hover {
+      background: var(--button-hover);
+    }
+
+    #status {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #status.is-error {
+      color: var(--error);
+    }
+
+    iframe {
+      border: 0;
+      display: block;
+      height: calc(100vh - 42px);
+      width: 100vw;
+    }
+  </style>
+</head>
+<body>
+  <form id="toolbar">
+    <input id="address" type="url" spellcheck="false" value="${escapeAttr(initialUrl)}" aria-label="URL">
+    <button type="submit">Go</button>
+    <span id="status">Remote proxy</span>
+  </form>
+  <iframe id="frame" src="${escapeAttr(frameSrc)}" sandbox="allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"></iframe>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    const form = document.getElementById('toolbar');
+    const input = document.getElementById('address');
+    const frame = document.getElementById('frame');
+    const status = document.getElementById('status');
+
+    function normalize(value) {
+      const trimmed = value.trim();
+      return /^https?:\\/\\//i.test(trimmed) ? trimmed : 'http://' + trimmed;
+    }
+
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      status.textContent = 'Navigating...';
+      status.classList.remove('is-error');
+      vscode.postMessage({ type: 'proxyNavigate', url: normalize(input.value) });
+    });
+
+    window.addEventListener('message', (event) => {
+      const message = event.data;
+
+      if (message && message.__vscodeBrowserSshProxy === true && message.url) {
+        input.value = message.url;
+        status.textContent = 'Remote proxy';
+      }
+
+      if (message.type === 'proxyNavigate') {
+        input.value = message.url;
+        frame.src = message.frameSrc;
+        status.textContent = 'Remote proxy';
+        status.classList.remove('is-error');
+      }
+
+      if (message.type === 'error') {
+        status.textContent = message.message;
+        status.classList.add('is-error');
+      }
+    });
+  </script>
+</body>
+</html>`;
 }
 
 function buildRemoteBrowserPreview(webview: vscode.Webview, initialUrl: string): string {
@@ -561,6 +1019,7 @@ function buildRemoteBrowserPreview(webview: vscode.Webview, initialUrl: string):
       return {
         width: Math.max(320, Math.floor(rect.width)),
         height: Math.max(240, Math.floor(rect.height)),
+        devicePixelRatio: window.devicePixelRatio || 1,
       };
     }
 
@@ -638,6 +1097,8 @@ function buildRemoteBrowserPreview(webview: vscode.Webview, initialUrl: string):
       if (message.type === 'frame') {
         viewport = { width: message.width, height: message.height };
         frame.src = message.src;
+        frame.width = message.imageWidth || message.width;
+        frame.height = message.imageHeight || message.height;
         empty.hidden = true;
         error.textContent = '';
       }
@@ -817,6 +1278,197 @@ function safeUriSegments(path: string): string[] {
     });
 }
 
+async function readRequestBody(request: IncomingMessage): Promise<Buffer | undefined> {
+  if (request.method === 'GET' || request.method === 'HEAD') {
+    return undefined;
+  }
+
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks);
+}
+
+function requestHeadersForTarget(request: IncomingMessage, target: URL): Headers {
+  const headers = new Headers();
+
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (!value || shouldDropRequestHeader(name)) {
+      continue;
+    }
+
+    const text = Array.isArray(value) ? value.join(', ') : value;
+    headers.set(name, text);
+  }
+
+  headers.set('host', target.host);
+  headers.set('origin', target.origin);
+  return headers;
+}
+
+function upgradeHeadersForTarget(request: IncomingMessage, target: URL): string {
+  const lines: string[] = [];
+
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (!value || name.toLowerCase() === 'host') {
+      continue;
+    }
+
+    lines.push(`${name}: ${Array.isArray(value) ? value.join(', ') : value}`);
+  }
+
+  lines.push(`host: ${target.host}`);
+  return `${lines.join('\r\n')}\r\n`;
+}
+
+function responseHeadersForClient(headers: Headers, proxyPort: number, currentOrigin: string): Record<string, string | string[]> {
+  const output: Record<string, string | string[]> = {};
+
+  for (const [name, value] of headers.entries()) {
+    const lower = name.toLowerCase();
+
+    if (shouldDropResponseHeader(lower)) {
+      continue;
+    }
+
+    if (lower === 'location') {
+      output[name] = proxyPathForUrl(new URL(value, currentOrigin).toString());
+      continue;
+    }
+
+    if (lower === 'set-cookie') {
+      output[name] = rewriteSetCookie(value);
+      continue;
+    }
+
+    output[name] = value;
+  }
+
+  output['access-control-allow-origin'] = '*';
+  output['x-vscode-browser-ssh-proxy-port'] = String(proxyPort);
+  return output;
+}
+
+function rewriteHtmlForProxy(html: string, documentUrl: string, currentOrigin: string): string {
+  const rewritten = html
+    .replace(/\b(src|href|action|poster)\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/gi, (match, attr: string, raw: string, doubleQuoted?: string, singleQuoted?: string, unquoted?: string) => {
+      const value = doubleQuoted ?? singleQuoted ?? unquoted ?? '';
+      const next = rewriteBrowserUrl(value, documentUrl, currentOrigin);
+
+      if (next === value) {
+        return match;
+      }
+
+      const quote = raw.startsWith("'") ? "'" : '"';
+      return `${attr}=${quote}${escapeAttr(next)}${quote}`;
+    })
+    .replace(/\bsrcset\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/gi, (match, raw: string, doubleQuoted?: string, singleQuoted?: string, unquoted?: string) => {
+      const value = doubleQuoted ?? singleQuoted ?? unquoted ?? '';
+      const next = value
+        .split(',')
+        .map((candidate) => {
+          const trimmed = candidate.trim();
+          const firstSpace = trimmed.search(/\s/);
+
+          if (firstSpace === -1) {
+            return rewriteBrowserUrl(trimmed, documentUrl, currentOrigin);
+          }
+
+          return `${rewriteBrowserUrl(trimmed.slice(0, firstSpace), documentUrl, currentOrigin)}${trimmed.slice(firstSpace)}`;
+        })
+        .join(', ');
+
+      const quote = raw.startsWith("'") ? "'" : '"';
+      return `srcset=${quote}${escapeAttr(next)}${quote}`;
+    });
+
+  const script = `<script>try{parent.postMessage({__vscodeBrowserSshProxy:true,url:${JSON.stringify(documentUrl)}},'*')}catch(_){}</script>`;
+
+  if (/<head[^>]*>/i.test(rewritten)) {
+    return rewritten.replace(/<head([^>]*)>/i, `<head$1>${script}`);
+  }
+
+  return `${script}${rewritten}`;
+}
+
+function rewriteCssForProxy(css: string, documentUrl: string, currentOrigin: string): string {
+  return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, quote: string, value: string) => {
+    const next = rewriteBrowserUrl(value.trim(), documentUrl, currentOrigin);
+    return next === value ? match : `url(${quote}${next}${quote})`;
+  });
+}
+
+function rewriteBrowserUrl(value: string, documentUrl: string, currentOrigin: string): string {
+  if (!value || /^(?:#|data:|blob:|mailto:|tel:|javascript:)/i.test(value)) {
+    return value;
+  }
+
+  try {
+    const absolute = new URL(value, documentUrl);
+
+    if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') {
+      return value;
+    }
+
+    if (absolute.origin === currentOrigin) {
+      return `${absolute.pathname}${absolute.search}${absolute.hash}`;
+    }
+
+    return proxyPathForUrl(absolute.toString());
+  } catch {
+    return value;
+  }
+}
+
+function proxyPathForUrl(url: string): string {
+  return `/__vscode_browser_ssh__/abs/${encodeBase64Url(url)}`;
+}
+
+function encodeBase64Url(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64url');
+}
+
+function decodeBase64Url(value: string): string {
+  return Buffer.from(value, 'base64url').toString('utf8');
+}
+
+function shouldDropRequestHeader(name: string): boolean {
+  return ['host', 'connection', 'content-length', 'accept-encoding'].includes(name.toLowerCase());
+}
+
+function shouldDropResponseHeader(name: string): boolean {
+  return [
+    'content-encoding',
+    'content-length',
+    'content-security-policy',
+    'content-security-policy-report-only',
+    'cross-origin-embedder-policy',
+    'cross-origin-opener-policy',
+    'cross-origin-resource-policy',
+    'transfer-encoding',
+    'x-frame-options',
+  ].includes(name.toLowerCase());
+}
+
+function rewriteSetCookie(value: string): string {
+  return value
+    .replace(/;\s*domain=[^;]*/gi, '')
+    .replace(/;\s*secure/gi, '');
+}
+
+function isRedirect(status: number): boolean {
+  return status >= 300 && status < 400;
+}
+
+function isHtmlRequest(request: IncomingMessage, response: Response): boolean {
+  const accept = request.headers.accept ?? '';
+  const contentType = response.headers.get('content-type') ?? '';
+  return contentType.includes('text/html') || String(accept).includes('text/html');
+}
+
 async function resolveUrlInput(initialUrl?: string): Promise<string | undefined> {
   const candidate = normalizeUrl(initialUrl?.trim());
 
@@ -857,10 +1509,21 @@ function normalizeViewport(width: number, height: number): { width: number; heig
   };
 }
 
+function normalizeDeviceScaleFactor(devicePixelRatio: number): number {
+  const { maxDeviceScaleFactor } = getRemoteBrowserConfig();
+
+  if (typeof devicePixelRatio !== 'number' || Number.isNaN(devicePixelRatio)) {
+    return 1;
+  }
+
+  return clampNumber(devicePixelRatio, 1, maxDeviceScaleFactor);
+}
+
 function getRemoteBrowserConfig(): {
   executablePath: string;
   frameRate: number;
   jpegQuality: number;
+  maxDeviceScaleFactor: number;
   launchArgs: string[];
 } {
   const config = vscode.workspace.getConfiguration('vscode-browser-ssh');
@@ -868,8 +1531,9 @@ function getRemoteBrowserConfig(): {
 
   return {
     executablePath: config.get<string>('browserExecutablePath', '').trim(),
-    frameRate: clampNumber(config.get<number>('frameRate', 6), 1, 20),
-    jpegQuality: clampNumber(config.get<number>('jpegQuality', 72), 30, 95),
+    frameRate: clampNumber(config.get<number>('frameRate', 15), 1, 30),
+    jpegQuality: clampNumber(config.get<number>('jpegQuality', 62), 30, 95),
+    maxDeviceScaleFactor: clampNumber(config.get<number>('maxDeviceScaleFactor', 1.25), 1, 2),
     launchArgs: Array.isArray(launchArgs) ? launchArgs.filter((arg): arg is string => typeof arg === 'string') : [],
   };
 }
@@ -889,12 +1553,6 @@ function resolveBrowserExecutable(configuredPath: string): string | undefined {
     if (existsSync(candidate)) {
       return candidate;
     }
-  }
-
-  const playwrightExecutable = chromium.executablePath();
-
-  if (existsSync(playwrightExecutable)) {
-    return playwrightExecutable;
   }
 
   for (const candidate of browserExecutableCandidates()) {
@@ -1085,9 +1743,10 @@ function escapeAttr(value: string): string {
 }
 
 type WebviewMessage =
-  | { type: 'ready'; width: number; height: number }
+  | { type: 'proxyNavigate'; url?: string }
+  | { type: 'ready'; width: number; height: number; devicePixelRatio: number }
   | { type: 'navigate'; url?: string }
-  | { type: 'resize'; width: number; height: number }
+  | { type: 'resize'; width: number; height: number; devicePixelRatio: number }
   | { type: 'mouseMove'; x: number; y: number }
   | { type: 'mouseDown'; x: number; y: number; button: MouseButton }
   | { type: 'mouseUp'; x: number; y: number; button: MouseButton }
@@ -1106,10 +1765,16 @@ type WebviewMessage =
   | { type: 'reload' };
 
 type ExtensionToWebviewMessage =
-  | { type: 'frame'; src: string; width: number; height: number }
+  | { type: 'proxyNavigate'; frameSrc: string; url: string }
+  | { type: 'frame'; src: string; width: number; height: number; imageWidth: number; imageHeight: number }
   | { type: 'viewport'; width: number; height: number }
   | { type: 'navigation'; title: string; url: string }
   | { type: 'status'; status: string }
   | { type: 'error'; message: string };
 
 type MouseButton = 'left' | 'right' | 'middle';
+
+type ScreencastFrameEvent = {
+  data: string;
+  sessionId: number;
+};

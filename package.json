@@ -1,14 +1,10 @@
 {
-  "name": "vscode-browser-ssh",
-  "displayName": "Browser SSH Proxy Preview",
-  "description": "Preview workspace HTML files and remote-only HTTP/HTTPS URLs inside VS Code through a Remote SSH proxy.",
+  "name": "improved-html-preview",
+  "displayName": "Improved HTML Preview",
+  "description": "Preview workspace HTML files and local or remote HTTP/HTTPS URLs inside VS Code with browser-like behavior.",
   "version": "0.0.1",
   "publisher": "local",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/ThePickleGawd/vscode-browser-ssh.git"
-  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -16,9 +12,9 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:vscode-browser-ssh.openHtml",
-    "onCommand:vscode-browser-ssh.openUrl",
-    "onCommand:vscode-browser-ssh.openUrlAtCursor"
+    "onCommand:improved-html-preview.openHtml",
+    "onCommand:improved-html-preview.openUrl",
+    "onCommand:improved-html-preview.openUrlAtCursor"
   ],
   "main": "./dist/extension.js",
   "extensionKind": [
@@ -27,58 +23,36 @@
   "contributes": {
     "commands": [
       {
-        "command": "vscode-browser-ssh.openHtml",
-        "title": "Open HTML in VS Code Browser",
-        "category": "Browser SSH"
+        "command": "improved-html-preview.openHtml",
+        "title": "Open HTML Preview",
+        "category": "Improved HTML Preview"
       },
       {
-        "command": "vscode-browser-ssh.openUrl",
-        "title": "Open URL through Remote Proxy",
-        "category": "Browser SSH"
+        "command": "improved-html-preview.openUrl",
+        "title": "Open URL Preview",
+        "category": "Improved HTML Preview"
       },
       {
-        "command": "vscode-browser-ssh.openUrlAtCursor",
-        "title": "Open URL at Cursor through Remote Proxy",
-        "category": "Browser SSH"
+        "command": "improved-html-preview.openUrlAtCursor",
+        "title": "Open URL at Cursor",
+        "category": "Improved HTML Preview"
       }
     ],
     "keybindings": [
       {
-        "command": "vscode-browser-ssh.openHtml",
+        "command": "improved-html-preview.openHtml",
         "key": "ctrl+shift+v",
         "mac": "cmd+shift+v",
         "when": "editorTextFocus && (resourceExtname == .html || resourceExtname == .htm)"
       }
-    ],
-    "menus": {
-      "explorer/context": [
-        {
-          "command": "vscode-browser-ssh.openHtml",
-          "when": "resourceExtname == .html || resourceExtname == .htm",
-          "group": "navigation"
-        }
-      ],
-      "editor/title/context": [
-        {
-          "command": "vscode-browser-ssh.openHtml",
-          "when": "resourceExtname == .html || resourceExtname == .htm",
-          "group": "navigation"
-        }
-      ],
-      "editor/context": [
-        {
-          "command": "vscode-browser-ssh.openUrlAtCursor",
-          "when": "editorHasSelection",
-          "group": "navigation"
-        }
-      ]
-    }
+    ]
   },
   "scripts": {
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "check": "tsc --noEmit -p ./",
-    "package": "vsce package"
+    "package": "vsce package --allow-missing-repository"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inline Reveal Script Demo</title>
+  <style>
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background: #090b09;
+      color: #e8efe6;
+      font: 18px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    main {
+      max-width: 720px;
+      padding: 32px;
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(18px);
+      transition: opacity 0.4s ease, transform 0.4s ease;
+    }
+
+    .reveal.in {
+      opacity: 1;
+      transform: none;
+    }
+
+    strong {
+      color: #76b900;
+    }
+  </style>
+</head>
+<body>
+  <main class="reveal">
+    <h1>Inline scripts are running.</h1>
+    <p>
+      This text starts hidden with <strong>opacity: 0</strong>. A normal browser
+      preview must execute the inline script below and add the reveal class.
+    </p>
+  </main>
+  <script>
+    window.setTimeout(() => {
+      document.querySelector('.reveal')?.classList.add('in');
+    }, 120);
+  </script>
+</body>
+</html>

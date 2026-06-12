@@ -90,20 +90,6 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
   }
 
   const session = new LocalHtmlPreviewSession(uri);
-
-  try {
-    await session.start();
-  } catch (error) {
-    const panel = vscode.window.createWebviewPanel(
-      'modernHtmlPreview',
-      title,
-      vscode.ViewColumn.Active,
-      { enableScripts: true, retainContextWhenHidden: true },
-    );
-    panel.webview.html = buildErrorPage(panel.webview, `Could not open ${uri.toString()}`, error);
-    return;
-  }
-
   const panel = vscode.window.createWebviewPanel(
     'modernHtmlPreview',
     title,
@@ -114,6 +100,10 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
       localResourceRoots: [session.rootUri],
     },
   );
+  // Register before any awaits so that invoking the command again while the
+  // session is still starting reveals this panel instead of racing a
+  // duplicate.
+  htmlPreviewPanels.set(uri.toString(), { panel, session });
   let disposed = false;
 
   const reload = debounce(async () => {
@@ -127,18 +117,28 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
         frame: await session.frameContentForDocument(panel.webview),
       } satisfies ExtensionToWebviewMessage);
     } catch (error) {
-      panel.webview.html = buildErrorPage(panel.webview, `Could not open ${uri.toString()}`, error);
+      if (!disposed) {
+        panel.webview.html = buildErrorPage(panel.webview, `Could not open ${uri.toString()}`, error);
+      }
     }
   }, 150);
 
   try {
+    await session.start();
+
+    if (disposed) {
+      return;
+    }
+
     panel.webview.html = buildLocalHtmlPreview(panel.webview, uri, await session.frameContentForDocument(panel.webview));
   } catch (error) {
-    panel.webview.html = buildErrorPage(panel.webview, `Could not open ${uri.toString()}`, error);
+    if (!disposed) {
+      panel.webview.html = buildErrorPage(panel.webview, `Could not open ${uri.toString()}`, error);
+    }
   }
 
   const messageSub = panel.webview.onDidReceiveMessage(async (message: WebviewMessage) => {
-    if (message.type !== 'htmlReload') {
+    if (disposed || message.type !== 'htmlReload') {
       return;
     }
 
@@ -148,10 +148,12 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
         frame: await session.frameContentForDocument(panel.webview),
       } satisfies ExtensionToWebviewMessage);
     } catch (error) {
-      await panel.webview.postMessage({
-        type: 'error',
-        message: error instanceof Error ? error.message : String(error),
-      } satisfies ExtensionToWebviewMessage);
+      if (!disposed) {
+        await panel.webview.postMessage({
+          type: 'error',
+          message: error instanceof Error ? error.message : String(error),
+        } satisfies ExtensionToWebviewMessage);
+      }
     }
   }, null, context.subscriptions);
 
@@ -184,8 +186,6 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
     saveSub.dispose();
     watcher?.dispose();
   }, null, context.subscriptions);
-
-  htmlPreviewPanels.set(uri.toString(), { panel, session });
 }
 
 class LocalHtmlPreviewSession {
@@ -199,37 +199,11 @@ class LocalHtmlPreviewSession {
   }
 
   async start(): Promise<void> {
-    if (cachedPreviewMode === 'webview') {
-      this.mode = 'webview';
-      return;
-    }
-
-    const server = await previewServerForRoot(this.rootUri);
-    this.port = server.port;
-
-    if (cachedPreviewMode === undefined) {
-      // Probe where the client would reach a forwarded port. Remote Tunnels
-      // map forwarded ports to auth-gated devtunnels.ms URLs that an iframe
-      // cannot sign in to (it just gets a 401) — and webview portMapping
-      // does not route iframe navigations either, so this applies to desktop
-      // clients as much as web ones. When the port is not reachable on
-      // loopback, serve documents over the webview resource channel instead,
-      // which rides the same connection as the editor and needs no reachable
-      // port. The verdict only depends on the connection type, so it is
-      // cached for the window's lifetime.
-      const probeUri = await vscode.env.asExternalUri(vscode.Uri.parse(`http://localhost:${this.port}/`));
-      cachedPreviewMode = isLoopbackAuthority(probeUri.authority) ? 'server' : 'webview';
-      logPreview(`Probed forwarded port ${this.port} -> ${probeUri.authority}`);
-
-      if (cachedPreviewMode === 'webview') {
-        await stopAllPreviewServers();
-      }
-    }
-
+    cachedPreviewMode ??= await resolvePreviewMode(this.rootUri);
     this.mode = cachedPreviewMode;
 
-    if (this.mode === 'webview') {
-      this.port = 0;
+    if (this.mode === 'server') {
+      this.port = (await previewServerForRoot(this.rootUri)).port;
     }
 
     const uiKind = vscode.env.uiKind === vscode.UIKind.Web ? 'web' : 'desktop';
@@ -413,6 +387,34 @@ class PreviewServer {
     return resourceUri;
   }
 
+}
+
+// Decides once per window how previews reach the client; the verdict only
+// depends on the connection type.
+async function resolvePreviewMode(rootUri: vscode.Uri): Promise<PreviewMode> {
+  if (vscode.env.remoteName === 'tunnel') {
+    // Forwarded ports are not usable from Remote Tunnel clients: web clients
+    // get auth-gated devtunnels.ms URLs that an iframe cannot sign in to,
+    // and desktop clients get a localhost URL whose forward does not answer
+    // (observed: asExternalUri reports localhost:<port> but the iframe loads
+    // nothing). Serve documents over the webview resource channel, which
+    // rides the same connection as the editor and needs no reachable port.
+    logPreview('Remote Tunnel connection: using webview-served previews.');
+    return 'webview';
+  }
+
+  // Elsewhere, probe where the client would reach a forwarded port and keep
+  // the HTTP server only when it stays on loopback (local, SSH, containers).
+  const server = await previewServerForRoot(rootUri);
+  const probeUri = await vscode.env.asExternalUri(vscode.Uri.parse(`http://localhost:${server.port}/`));
+  logPreview(`Probed forwarded port ${server.port} -> ${probeUri.authority}`);
+
+  if (isLoopbackAuthority(probeUri.authority)) {
+    return 'server';
+  }
+
+  await stopAllPreviewServers();
+  return 'webview';
 }
 
 function previewServerForRoot(rootUri: vscode.Uri): Promise<PreviewServer> {

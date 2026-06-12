@@ -1,12 +1,12 @@
-# Browser SSH Preview
+# Browser SSH Proxy Preview
 
 VS Code extension for opening workspace HTML files and remote-only HTTP/HTTPS URLs inside VS Code.
 
 ## Commands
 
 - `Browser SSH: Open HTML in VS Code Browser`
-- `Browser SSH: Open URL in Remote Browser`
-- `Browser SSH: Open URL at Cursor in Remote Browser`
+- `Browser SSH: Open URL through Remote Proxy`
+- `Browser SSH: Open URL at Cursor through Remote Proxy`
 
 HTML files can also be opened from the Explorer context menu.
 

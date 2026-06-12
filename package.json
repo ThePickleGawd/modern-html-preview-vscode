@@ -1,10 +1,14 @@
 {
   "name": "vscode-browser-ssh",
-  "displayName": "Browser SSH Preview",
-  "description": "Preview workspace HTML files and remote-rendered HTTP/HTTPS URLs inside VS Code.",
+  "displayName": "Browser SSH Proxy Preview",
+  "description": "Preview workspace HTML files and remote-only HTTP/HTTPS URLs inside VS Code through a Remote SSH proxy.",
   "version": "0.0.1",
   "publisher": "local",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThePickleGawd/vscode-browser-ssh.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -29,12 +33,12 @@
       },
       {
         "command": "vscode-browser-ssh.openUrl",
-        "title": "Open URL in Remote Browser",
+        "title": "Open URL through Remote Proxy",
         "category": "Browser SSH"
       },
       {
         "command": "vscode-browser-ssh.openUrlAtCursor",
-        "title": "Open URL at Cursor in Remote Browser",
+        "title": "Open URL at Cursor through Remote Proxy",
         "category": "Browser SSH"
       }
     ],
@@ -80,7 +84,6 @@
     "@types/node": "^22.10.2",
     "@types/vscode": "^1.90.0",
     "@vscode/vsce": "^3.2.1",
-    "playwright-core": "^1.60.0",
     "typescript": "^5.7.2"
   }
 }

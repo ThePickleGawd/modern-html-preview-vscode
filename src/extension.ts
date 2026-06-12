@@ -7,6 +7,12 @@ import * as path from 'path';
 const htmlPreviewPanels = new Map<string, HtmlPreviewEntry>();
 const previewServers = new Map<string, Promise<PreviewServer>>();
 let cachedPreviewMode: PreviewMode | undefined;
+let outputChannel: vscode.OutputChannel | undefined;
+
+function logPreview(message: string): void {
+  outputChannel ??= vscode.window.createOutputChannel('Modern HTML Preview');
+  outputChannel.appendLine(`[${new Date().toISOString()}] ${message}`);
+}
 const MIME_TYPES: Record<string, string> = {
   '.avif': 'image/avif',
   '.bmp': 'image/bmp',
@@ -84,12 +90,27 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
   }
 
   const session = new LocalHtmlPreviewSession(uri);
+
+  try {
+    await session.start();
+  } catch (error) {
+    const panel = vscode.window.createWebviewPanel(
+      'modernHtmlPreview',
+      title,
+      vscode.ViewColumn.Active,
+      { enableScripts: true, retainContextWhenHidden: true },
+    );
+    panel.webview.html = buildErrorPage(panel.webview, `Could not open ${uri.toString()}`, error);
+    return;
+  }
+
   const panel = vscode.window.createWebviewPanel(
     'modernHtmlPreview',
     title,
     vscode.ViewColumn.Active,
     {
       enableScripts: true,
+      portMapping: session.webviewPortMappings(),
       retainContextWhenHidden: true,
       localResourceRoots: [session.rootUri],
     },
@@ -112,8 +133,7 @@ async function openHtmlPreview(context: vscode.ExtensionContext, resource?: vsco
   }, 150);
 
   try {
-    const frame = await session.start(panel.webview);
-    panel.webview.html = buildLocalHtmlPreview(panel.webview, uri, frame);
+    panel.webview.html = buildLocalHtmlPreview(panel.webview, uri, await session.frameContentForDocument(panel.webview));
   } catch (error) {
     panel.webview.html = buildErrorPage(panel.webview, `Could not open ${uri.toString()}`, error);
   }
@@ -179,21 +199,32 @@ class LocalHtmlPreviewSession {
     this.rootUri = vscode.workspace.getWorkspaceFolder(documentUri)?.uri ?? dirname(documentUri);
   }
 
-  async start(webview: vscode.Webview): Promise<FrameContent> {
-    if (cachedPreviewMode !== 'webview') {
-      const server = await previewServerForRoot(this.rootUri);
-      this.port = server.port;
+  async start(): Promise<void> {
+    if (cachedPreviewMode === 'webview') {
+      this.mode = 'webview';
+      return;
+    }
 
-      if (cachedPreviewMode === undefined) {
-        // Probe where the client would reach a forwarded port. Remote
-        // Tunnels, for example, map forwarded ports to auth-gated
-        // devtunnels.ms URLs that an iframe cannot sign in to (it just gets
-        // a 401). In that case serve documents over the webview resource
-        // channel instead, which rides the same connection as the editor and
-        // needs no reachable port. The verdict only depends on the
-        // connection type, so it is cached for the lifetime of the window.
-        const probeUri = await vscode.env.asExternalUri(vscode.Uri.parse(`http://127.0.0.1:${this.port}/`));
+    const server = await previewServerForRoot(this.rootUri);
+    this.port = server.port;
+
+    if (cachedPreviewMode === undefined) {
+      if (vscode.env.uiKind === vscode.UIKind.Desktop) {
+        // Desktop webviews reach the server through the panel's port mapping
+        // on any transport (local, SSH, Remote Tunnels) without needing an
+        // externally reachable port.
+        cachedPreviewMode = 'server';
+      } else {
+        // Web clients have no port mapping, so probe where the browser would
+        // reach a forwarded port. Remote Tunnels map forwarded ports to
+        // auth-gated devtunnels.ms URLs that an iframe cannot sign in to (it
+        // just gets a 401). In that case serve documents over the webview
+        // resource channel instead, which rides the same connection as the
+        // editor and needs no reachable port. The verdict only depends on
+        // the connection type, so it is cached for the window's lifetime.
+        const probeUri = await vscode.env.asExternalUri(vscode.Uri.parse(`http://localhost:${this.port}/`));
         cachedPreviewMode = isLoopbackAuthority(probeUri.authority) ? 'server' : 'webview';
+        logPreview(`Probed forwarded port ${this.port} -> ${probeUri.authority}`);
 
         if (cachedPreviewMode === 'webview') {
           await stopAllPreviewServers();
@@ -201,8 +232,27 @@ class LocalHtmlPreviewSession {
       }
     }
 
-    this.mode = cachedPreviewMode ?? 'server';
-    return this.frameContentForDocument(webview);
+    this.mode = cachedPreviewMode;
+
+    if (this.mode === 'webview') {
+      this.port = 0;
+    }
+
+    const uiKind = vscode.env.uiKind === vscode.UIKind.Web ? 'web' : 'desktop';
+    logPreview(`Opening ${this.documentUri.toString()}: mode=${this.mode}, uiKind=${uiKind}, remote=${vscode.env.remoteName ?? 'none'}, port=${this.port}`);
+  }
+
+  webviewPortMappings(): vscode.WebviewPortMapping[] {
+    if (!this.port || vscode.env.uiKind === vscode.UIKind.Web) {
+      return [];
+    }
+
+    return [
+      {
+        extensionHostPort: this.port,
+        webviewPort: this.port,
+      },
+    ];
   }
 
   async frameContentForDocument(webview: vscode.Webview): Promise<FrameContent> {
@@ -215,8 +265,15 @@ class LocalHtmlPreviewSession {
     }
 
     const route = this.virtualPathForUri(this.documentUri);
-    const localUri = vscode.Uri.parse(`http://127.0.0.1:${this.port}${route}`);
-    return { kind: 'src', value: (await vscode.env.asExternalUri(localUri)).toString() };
+    const localUri = vscode.Uri.parse(`http://localhost:${this.port}${route}`);
+
+    if (vscode.env.uiKind === vscode.UIKind.Web) {
+      return { kind: 'src', value: (await vscode.env.asExternalUri(localUri)).toString() };
+    }
+
+    // Desktop: the panel's port mapping routes localhost iframes to the
+    // extension host, so the URL is usable as-is on every transport.
+    return { kind: 'src', value: localUri.toString() };
   }
 
   private async documentHtmlWithBase(webview: vscode.Webview): Promise<string> {

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Remote Preview Lab</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero" aria-labelledby="page-title">
+      <div class="hero__copy">
+        <p class="eyebrow">VS Code Browser SSH Demo</p>
+        <h1 id="page-title">Remote Preview Lab</h1>
+        <p class="lede">
+          A compact HTML page for checking local assets, live scripts, anchors,
+          forms, and responsive layout inside the extension webview.
+        </p>
+        <div class="actions" aria-label="Demo actions">
+          <button id="ping-button" type="button">Run Check</button>
+          <a href="#activity">View Activity</a>
+        </div>
+      </div>
+
+      <figure class="viewport">
+        <img src="./images/terminal-viewport.svg" alt="Stylized browser and terminal preview">
+        <figcaption>
+          <span id="health-dot" class="health-dot" aria-hidden="true"></span>
+          <span id="health-text">Ready for preview</span>
+        </figcaption>
+      </figure>
+    </section>
+
+    <section class="metrics" aria-label="Preview checks">
+      <article>
+        <strong>HTML</strong>
+        <span>Loaded from workspace</span>
+      </article>
+      <article>
+        <strong>CSS</strong>
+        <span>External stylesheet</span>
+      </article>
+      <article>
+        <strong>JS</strong>
+        <span>Interactive script</span>
+      </article>
+      <article>
+        <strong>SVG</strong>
+        <span>Relative image asset</span>
+      </article>
+    </section>
+
+    <section id="activity" class="activity" aria-labelledby="activity-title">
+      <div>
+        <p class="eyebrow">Activity</p>
+        <h2 id="activity-title">Preview Event Log</h2>
+      </div>
+      <ol id="event-log" aria-live="polite">
+        <li>Demo page initialized.</li>
+        <li>Stylesheet and image requested via relative paths.</li>
+      </ol>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>

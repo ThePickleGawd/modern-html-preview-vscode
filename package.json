@@ -41,6 +41,11 @@
         "key": "ctrl+shift+v",
         "mac": "cmd+shift+v",
         "when": "editorTextFocus && (resourceExtname == .html || resourceExtname == .htm)"
+      },
+      {
+        "command": "modern-html-preview.openHtml",
+        "key": "ctrl+shift+v",
+        "when": "isMac && editorTextFocus && (resourceExtname == .html || resourceExtname == .htm)"
       }
     ]
   },

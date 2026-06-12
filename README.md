@@ -12,4 +12,4 @@ Traditional HTML preview injects HTML into a webview. Modern HTML Preview serves
 
 You can't always forward a port.
 
-Live Server needs a server port in remote workspaces. In some setups, like Remote Tunnels, you cannot do that. Modern HTML Preview works from the editor shortcut without managing a server or port.
+Live Server needs a server port in remote workspaces. In some setups, like Remote Tunnels, you cannot do that. Modern HTML Preview works from the editor shortcut without managing a server or port: over Remote Tunnels it serves the page through VS Code itself (a "Fallback (no port)" badge appears in the toolbar), and everywhere else you get the full local-server experience. In fallback mode, root-relative paths and multi-page navigation may behave differently.
